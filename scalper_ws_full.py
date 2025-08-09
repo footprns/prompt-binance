@@ -77,7 +77,11 @@ class BinanceScalper:
         self.base_asset = "BASE"
         self.quote_asset = "QUOTE"
         self.min_qty = None
+        self.max_qty = None
+        self.market_min_qty = None
+        self.market_max_qty = None
         self.min_notional = None
+        self.max_num_orders = None
 
         # Initialize symbol info
         self._get_symbol_info()
@@ -93,6 +97,10 @@ class BinanceScalper:
                     self.base_asset = symbol['baseAsset']
                     self.quote_asset = symbol['quoteAsset']
                     self.min_notional = None
+                    self.max_qty = None
+                    self.market_min_qty = None
+                    self.market_max_qty = None
+                    self.max_num_orders = None
 
                     for f in symbol['filters']:
                         ftype = f['filterType']
@@ -103,13 +111,20 @@ class BinanceScalper:
                             step_size = f['stepSize']
                             self.quantity_precision = len(step_size.rstrip('0').split('.')[1]) if '.' in step_size else 0
                             self.min_qty = float(f['minQty'])
+                            self.max_qty = float(f.get('maxQty', 0)) if f.get('maxQty') != '9000000000' else None
+                        elif ftype == 'MARKET_LOT_SIZE':
+                            self.market_min_qty = float(f['minQty'])
+                            self.market_max_qty = float(f.get('maxQty', 0)) if f.get('maxQty') != '9000000000' else None
                         elif ftype in ('MIN_NOTIONAL', 'NOTIONAL'):
                             self.min_notional = float(f.get('minNotional') or f.get('notional') or 0.0)
+                        elif ftype == 'MAX_NUM_ORDERS':
+                            self.max_num_orders = int(f.get('maxNumOrders', 200))
 
                     logger.info(
                         f"Symbol info: {SYMBOL} | base={self.base_asset}, quote={self.quote_asset} | "
                         f"price_precision={self.price_precision}, qty_precision={self.quantity_precision}, "
-                        f"min_qty={self.min_qty}, min_notional={self.min_notional}"
+                        f"min_qty={self.min_qty}, market_min_qty={self.market_min_qty}, "
+                        f"min_notional={self.min_notional}, max_orders={self.max_num_orders}"
                     )
                     break
         except Exception as e:
@@ -191,9 +206,16 @@ class BinanceScalper:
         try:
             formatted_qty = self.format_quantity(quantity)
 
-            # LOT_SIZE check
-            if self.min_qty is not None and formatted_qty < self.min_qty:
-                logger.error(f"Quantity {formatted_qty} below minimum {self.min_qty}")
+            # Market LOT_SIZE check (preferred for market orders)
+            min_check = self.market_min_qty if self.market_min_qty else self.min_qty
+            max_check = self.market_max_qty if self.market_max_qty else self.max_qty
+
+            if min_check is not None and formatted_qty < min_check:
+                logger.error(f"Quantity {formatted_qty} below minimum {min_check} (market order)")
+                return (None, 0.0)
+            
+            if max_check is not None and formatted_qty > max_check:
+                logger.error(f"Quantity {formatted_qty} above maximum {max_check} (market order)")
                 return (None, 0.0)
 
             logger.info(f"Placing {side} order: {formatted_qty} {SYMBOL}")
@@ -330,16 +352,19 @@ class BinanceScalper:
             if not (take_profit or stop_loss):
                 return
 
-            # Sell only what we truly hold (position_qty ∩ free base balance), minus tiny epsilon
+            # Sell only what we truly hold, with more conservative buffer
             base_free = self.get_asset_free(self.base_asset)
-            sellable = min(self.position_qty, base_free) * 0.999  # guard against fee dust
+            sellable = min(self.position_qty, base_free) * 0.995  # 99.5% to account for fees
             sell_qty = self.format_quantity(sellable)
 
-            if self.min_qty is not None and sell_qty < self.min_qty:
-                logger.warning(f"Sell qty {sell_qty} below minQty {self.min_qty}; attempting full free balance.")
-                sell_qty = self.format_quantity(base_free * 0.999)
-                if sell_qty < self.min_qty:
-                    logger.error(f"Cannot sell: available {base_free} < minQty {self.min_qty}")
+            # Use market-specific minimum quantity if available
+            min_check = self.market_min_qty if self.market_min_qty else self.min_qty
+            if min_check is not None and sell_qty < min_check:
+                logger.warning(f"Sell qty {sell_qty} below market minQty {min_check}; attempting adjusted calculation.")
+                # Try using 99% of available balance
+                sell_qty = self.format_quantity(base_free * 0.99)
+                if sell_qty < min_check:
+                    logger.error(f"Cannot sell: available {base_free} results in qty {sell_qty} < minQty {min_check}")
                     return
 
             # Ensure sell notional is valid to avoid -1013
