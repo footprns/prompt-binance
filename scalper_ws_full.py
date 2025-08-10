@@ -8,6 +8,7 @@ import threading
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from binance.client import Client
+from trade_logger_integration import TradeLogger
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -85,6 +86,9 @@ class BinanceScalper:
 
         # Initialize symbol info
         self._get_symbol_info()
+
+        self.trade_logger = TradeLogger()
+        self.spread_at_entry = 0.0
 
     # ---------- Exchange Metadata ----------
     def _get_symbol_info(self):
@@ -278,6 +282,7 @@ class BinanceScalper:
         except Exception as e:
             logger.error(f"Error processing WebSocket message: {e}")
 
+
     def handle_depth_data(self, data):
         """Handle depth stream data for entry signals"""
         # Don't try to re-enter while in a position, during cooldown, or when paused
@@ -296,6 +301,9 @@ class BinanceScalper:
 
             # Update current price mid
             self.current_price = (best_bid + best_ask) / 2.0
+            
+            # Store spread for logging
+            self.spread_at_entry = spread
 
             if spread >= MIN_SPREAD:
                 logger.info(f"Spread trigger: {spread:.6f} >= {MIN_SPREAD}")
@@ -337,6 +345,7 @@ class BinanceScalper:
         except Exception as e:
             logger.error(f"Error in depth handler: {e}")
 
+
     def handle_trade_data(self, data):
         """Handle trade stream data for exit signals"""
         try:
@@ -375,6 +384,24 @@ class BinanceScalper:
             exit_price, exec_qty = self.place_order(Client.SIDE_SELL, sell_qty)
             if exit_price and exec_qty > 0:
                 pct = ((exit_price - self.entry_price) / self.entry_price) * 100.0
+                
+                # Log the trade to database
+                reason = 'profit_target' if take_profit else 'stop_loss'
+                try:
+                    self.trade_logger.log_trade(
+                        symbol=SYMBOL,
+                        side='BUY',
+                        entry_price=self.entry_price,
+                        exit_price=exit_price,
+                        quantity=self.position_qty,
+                        pnl_pct=pct / 100.0,  # Convert to decimal
+                        martingale_step=self.martingale_step,
+                        reason=reason,
+                        spread_at_entry=self.spread_at_entry
+                    )
+                except Exception as log_error:
+                    logger.error(f"Failed to log trade: {log_error}")
+                
                 msg = ""
                 try:
                     if take_profit:
