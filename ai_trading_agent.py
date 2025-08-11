@@ -95,6 +95,7 @@ class TradingDatabase:
                 )
             ''')
             
+            # Create config_changes table with all columns
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS config_changes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,12 +105,28 @@ class TradingDatabase:
                     old_value REAL,
                     new_value REAL,
                     reason TEXT,
-                    confidence REAL,
-                    statistical_significance REAL,
-                    model_used TEXT,
-                    expected_impact TEXT
+                    confidence REAL
                 )
             ''')
+            
+            # Add new columns if they don't exist (migration)
+            try:
+                cursor.execute('ALTER TABLE config_changes ADD COLUMN statistical_significance REAL')
+                logger.info("Added statistical_significance column to config_changes table")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            
+            try:
+                cursor.execute('ALTER TABLE config_changes ADD COLUMN model_used TEXT')
+                logger.info("Added model_used column to config_changes table")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+                
+            try:
+                cursor.execute('ALTER TABLE config_changes ADD COLUMN expected_impact TEXT')
+                logger.info("Added expected_impact column to config_changes table")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_symbol_timestamp 
@@ -180,7 +197,7 @@ class DeepSeekAnalyzer:
     def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com"):
         self.api_key = api_key
         self.base_url = base_url
-        self.model_name = "deepseek-chat"
+        self.model_name = "deepseek-chat"  # Back to stable working model
         
         self.client = openai.OpenAI(
             api_key=api_key,
@@ -206,6 +223,9 @@ class DeepSeekAnalyzer:
         prompt = self._create_enhanced_analysis_prompt(analysis_data)
         
         try:
+            # Simple, reliable API call for deepseek-chat
+            logger.info(f"Calling {self.model_name} API...")
+            
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
@@ -216,11 +236,24 @@ class DeepSeekAnalyzer:
                 max_tokens=3000
             )
             
-            ai_response = response.choices[0].message.content
-            logger.info("Enhanced AI analysis completed")
+            # Simple response handling
+            if not response.choices or len(response.choices) == 0:
+                logger.error("No choices in API response")
+                return []
             
-            # Log the raw AI response for debugging (first 500 chars)
-            logger.debug(f"Raw AI response preview: {ai_response[:500]}...")
+            choice = response.choices[0]
+            if not hasattr(choice, 'message') or not choice.message:
+                logger.error("No message in API response choice")
+                return []
+            
+            ai_response = choice.message.content
+            if not ai_response:
+                logger.error("Empty AI response content")
+                return []
+            
+            logger.info("AI analysis completed")
+            logger.info(f"Response length: {len(ai_response)} characters")
+            logger.info(f"AI response preview (first 300 chars): {ai_response[:300]}...")
             
             recommendations = self._parse_enhanced_ai_recommendations(ai_response, metrics)
             validated_recommendations = self._validate_recommendations(recommendations, current_config)
@@ -229,26 +262,36 @@ class DeepSeekAnalyzer:
             
         except Exception as e:
             logger.error(f"DeepSeek AI analysis failed: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
             return []
     
     def _get_system_prompt(self) -> str:
-        """Enhanced system prompt for better AI responses"""
-        return """You are an expert quantitative trading analyst specializing in cryptocurrency scalping strategies. 
+        """Enhanced system prompt optimized for DeepSeek-Reasoner"""
+        return """You are an expert quantitative trading analyst specializing in cryptocurrency scalping strategies. Use your reasoning capabilities to provide thorough analysis.
 
 Your expertise includes:
 - Statistical analysis and hypothesis testing
-- Risk management optimization
+- Risk management optimization  
 - Market microstructure analysis
 - Algorithmic trading parameter tuning
 
+REASONING PROCESS:
+1. First, analyze the statistical significance of the data
+2. Identify the primary performance issues based on metrics
+3. Consider the risk-reward trade-offs for each potential change
+4. Evaluate the confidence level based on sample size and data quality
+5. Provide specific, actionable recommendations
+
 Always provide:
 1. Statistically significant recommendations (p < 0.05 when possible)
-2. Risk-adjusted performance metrics
+2. Risk-adjusted performance metrics analysis
 3. Confidence scores based on sample size and data quality
-4. Clear reasoning for each recommendation
+4. Clear reasoning chain for each recommendation
+5. Expected impact quantification
 
 Focus on maximizing risk-adjusted returns while maintaining strict risk controls.
-Respond ONLY in valid JSON format with decimal numbers (no % signs or $ symbols)."""
+Think step-by-step and show your reasoning before providing the final JSON response.
+Respond with your reasoning first, then provide ONLY valid JSON format with decimal numbers (no % signs or $ symbols)."""
     
     def _calculate_performance_metrics(self, trades: List[Trade]) -> PerformanceMetrics:
         """Calculate comprehensive performance metrics"""
@@ -385,15 +428,21 @@ STATISTICAL REQUIREMENTS:
 - Consider sample size in confidence scoring
 - Provide expected impact estimates
 
-Respond with JSON format including statistical justification for each recommendation.
+Please think through this step-by-step:
+1. What are the main performance issues?
+2. What statistical evidence supports each concern?
+3. What parameter changes would address these issues?
+4. What is the expected impact and confidence for each change?
 
-JSON Format Required:
+After your reasoning, provide your final recommendations in this EXACT JSON format (no additional text after JSON):
+
+```json
 {{
     "analysis_summary": "Brief statistical assessment",
     "primary_concerns": ["list", "of", "main", "issues"],
     "recommendations": [
         {{
-            "parameter": "PARAMETER_NAME",
+            "parameter": "PROFIT_TARGET",
             "current_value": 0.0035,
             "suggested_value": 0.004,
             "reason": "Statistical justification with metrics",
@@ -403,8 +452,14 @@ JSON Format Required:
         }}
     ]
 }}
+```
 
-CRITICAL: Use decimal numbers only (e.g., 0.0035 not 0.35% or $0.0035). No percentage signs, currency symbols, or text formatting in numeric values.
+CRITICAL FORMATTING REQUIREMENTS:
+- End your response with the JSON block above
+- Use exact parameter names: PROFIT_TARGET, STOP_LOSS, MIN_SPREAD, TRADE_QUANTITY
+- Use decimal numbers only (0.0035 not 0.35% or $0.0035)
+- Ensure valid JSON syntax (no trailing commas, proper quotes)
+- Put the JSON in a code block with ```json
 """
     
     def _parse_enhanced_ai_recommendations(self, ai_response: str, metrics: PerformanceMetrics) -> List[ConfigUpdate]:
@@ -412,18 +467,77 @@ CRITICAL: Use decimal numbers only (e.g., 0.0035 not 0.35% or $0.0035). No perce
         
         try:
             import re
-            json_match = re.search(r'\{.*\}', ai_response, re.DOTALL)
-            if not json_match:
+            
+            # Log the full response for debugging
+            logger.debug(f"Full AI response: {ai_response}")
+            
+            # DeepSeek-chat often wraps JSON in markdown code blocks
+            json_content = None
+            
+            # Approach 1: Look for JSON in markdown code blocks (```json or ```)
+            code_block_patterns = [
+                r'```json\s*(\{.*?\})\s*```',
+                r'```\s*(\{.*?\})\s*```',
+            ]
+            
+            for pattern in code_block_patterns:
+                matches = list(re.finditer(pattern, ai_response, re.DOTALL | re.IGNORECASE))
+                if matches:
+                    json_content = matches[-1].group(1)  # Use the last match
+                    logger.info("Found JSON in markdown code block")
+                    break
+            
+            # Approach 2: Look for standalone JSON blocks
+            if not json_content:
+                json_patterns = [
+                    r'\{[^{}]*"recommendations"[^{}]*\[[^\]]*\][^{}]*\}',  # Look for recommendations array
+                    r'\{.*?"analysis_summary".*?\}',  # Look for analysis_summary
+                    r'\{.*?"recommendations".*?\}',   # Look for recommendations key
+                    r'\{.*?\}',                      # Any JSON block
+                ]
+                
+                for pattern in json_patterns:
+                    matches = list(re.finditer(pattern, ai_response, re.DOTALL))
+                    if matches:
+                        # Use the largest match (most complete JSON)
+                        json_content = max(matches, key=lambda m: len(m.group())).group()
+                        logger.info(f"Found JSON using pattern: {pattern}")
+                        break
+            
+            if not json_content:
                 logger.error("No JSON found in AI response")
-                logger.error(f"AI response was: {ai_response[:500]}...")
-                return []
+                logger.error(f"AI response preview: {ai_response[:1000]}...")
+                
+                # Try to extract any JSON-like structure manually
+                if '"recommendations"' in ai_response:
+                    logger.info("Found 'recommendations' keyword, attempting manual extraction...")
+                    # Look for the recommendations array specifically
+                    rec_match = re.search(r'"recommendations"\s*:\s*\[.*?\]', ai_response, re.DOTALL)
+                    if rec_match:
+                        logger.info("Found recommendations array, creating minimal JSON...")
+                        json_content = '{"recommendations": ' + rec_match.group().split(':', 1)[1] + '}'
+                
+                if not json_content:
+                    return []
             
             try:
-                data = json.loads(json_match.group())
+                data = json.loads(json_content)
+                logger.info(f"Successfully parsed JSON with {len(data.get('recommendations', []))} recommendations")
             except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON in AI response: {e}")
-                logger.error(f"JSON content: {json_match.group()}")
-                return []
+                logger.error(f"Invalid JSON: {e}")
+                logger.error(f"JSON content: {json_content[:500]}...")
+                
+                # Try to fix common JSON issues
+                try:
+                    # Remove trailing commas
+                    fixed_json = re.sub(r',(\s*[}\]])', r'\1', json_content)
+                    # Fix unescaped quotes in strings
+                    fixed_json = re.sub(r'(?<!\\)"(?=.*".*:)', r'\\"', fixed_json)
+                    data = json.loads(fixed_json)
+                    logger.info("Fixed JSON and parsed successfully")
+                except json.JSONDecodeError:
+                    logger.error("Could not fix JSON, giving up")
+                    return []
             
             recommendations = []
             
@@ -449,10 +563,13 @@ CRITICAL: Use decimal numbers only (e.g., 0.0035 not 0.35% or $0.0035). No perce
                         logger.warning(f"  suggested_value: {rec.get('suggested_value')} -> {new_value}")
                         continue
                     
-                    # Validate parameter name
-                    parameter = rec.get('parameter', '').upper()
-                    if parameter not in ['PROFIT_TARGET', 'STOP_LOSS', 'MIN_SPREAD', 'TRADE_QUANTITY']:
-                        logger.warning(f"Unknown parameter in recommendation {i+1}: {parameter}")
+                    # Validate and normalize parameter name
+                    parameter = rec.get('parameter', '').upper().replace(' ', '_')
+                    valid_parameters = ['PROFIT_TARGET', 'STOP_LOSS', 'MIN_SPREAD', 'TRADE_QUANTITY']
+                    
+                    if parameter not in valid_parameters:
+                        logger.warning(f"Unknown parameter in recommendation {i+1}: '{rec.get('parameter')}' -> normalized: '{parameter}'")
+                        logger.warning(f"Valid parameters are: {valid_parameters}")
                         continue
                     
                     recommendations.append(ConfigUpdate(
@@ -732,7 +849,7 @@ class EnhancedTradingAgent:
                 update.reason,
                 update.confidence,
                 update.statistical_significance,
-                'deepseek-chat',
+                'deepseek-chat',  # Back to working model
                 update.expected_impact
             ))
             
