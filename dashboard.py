@@ -106,7 +106,8 @@ class DashboardData:
             active_traders = []
             trader_details = {}
             
-            for symbol in ['btcusdt', 'ethusdt', 'arbusdt', 'shibusdt', 'adausdt', 'dogeusdt', 'xrpusdt', 'bnbusdt']:
+            for symbol in ['btcusdt', 'ethusdt', 'arbusdt', 'shibusdt', 'adausdt', 'dogeusdt', 'xrpusdt', 'bnbusdt', 'pepeusdt']:
+            # Added PEPEUSDT
                 service_name = f'binance-scalper@{symbol}'
                 status = self._check_service_status(service_name)
                 
@@ -381,6 +382,8 @@ def dashboard():
                 <div class="tab" onclick="loadSymbol('DOGEUSDT')">DOGE/USDT</div>
                 <div class="tab" onclick="loadSymbol('XRPUSDT')">XRP/USDT</div>
                 <div class="tab" onclick="loadSymbol('BNBUSDT')">BNB/USDT</div>
+                <div class="tab" onclick="loadSymbol('PEPEUSDT')">PEPE/USDT</div>
+                <div class="tab" onclick="loadSymbol('TRONUSDT')">TRON/USDT</div>
             </div>
             
             <div class="metrics">
