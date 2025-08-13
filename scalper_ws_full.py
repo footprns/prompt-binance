@@ -338,461 +338,476 @@ class EnhancedBinanceScalper:
     # ---------- Enhanced Entry Logic ----------
     
     def handle_depth_data(self, data):
-            """Enhanced depth stream handler with order book validation"""
-            if self.trade_active or self.in_cooldown() or self.trading_paused:
+        """Enhanced depth stream handler with comprehensive debugging"""
+        if self.trade_active or self.in_cooldown() or self.trading_paused:
+            if self.trade_active:
+                logger.debug("Skipping entry - trade already active")
+            elif self.in_cooldown():
+                remaining = int(self.cooldown_until - self.now())
+                logger.debug(f"Skipping entry - cooldown for {remaining}s")
+            else:
+                logger.debug("Skipping entry - trading paused")
+            return
+
+        try:
+            bids = data.get("b", [])
+            asks = data.get("a", [])
+            
+            if not bids or not asks:
+                logger.debug("Empty bids or asks in depth data")
                 return
 
+            # Parse and validate order book data with enhanced debugging
             try:
-                bids = data.get("b", [])
-                asks = data.get("a", [])
+                best_bid = float(bids[0][0])
+                best_ask = float(asks[0][0])
                 
-                # Debug: Log raw data structure
-                logger.debug(f"Raw depth data keys: {list(data.keys())}")
-                logger.debug(f"Bids count: {len(bids)}, Asks count: {len(asks)}")
-                
-                if not bids or not asks:
-                    logger.debug("Empty bids or asks in depth data")
-                    return
-
-                # Parse and validate order book data
-                try:
-                    best_bid = float(bids[0][0])
-                    best_ask = float(asks[0][0])
+                # Check for inverted data and attempt to fix
+                if best_ask <= best_bid:
+                    logger.warning(f"Inverted order book detected: ask {best_ask} <= bid {best_bid}")
                     
-                    # Log for debugging
-                    logger.debug(f"Parsed: bid={best_bid}, ask={best_ask}")
-                    
-                    # Check for inverted data and attempt to fix
-                    if best_ask <= best_bid:
-                        logger.warning(f"Inverted order book detected: ask {best_ask} <= bid {best_bid}")
-                        
-                        # Attempt different parsing strategies
-                        alternative_fixes = [
-                            # Strategy 1: Try swapping bid/ask arrays
-                            (asks, bids, "Swapped bids/asks"),
-                            # Strategy 2: Try different array indices
-                            ([bids[0][::-1]], [asks[0][::-1]], "Reversed price/quantity order"),
-                            # Strategy 3: Try parsing as strings with different format
-                            (bids[1:], asks[1:], "Skip first entry"),
-                        ]
-                        
-                        for alt_bids, alt_asks, strategy in alternative_fixes:
-                            try:
-                                if alt_bids and alt_asks:
-                                    alt_best_bid = float(alt_bids[0][0])
-                                    alt_best_ask = float(alt_asks[0][0])
-                                    
-                                    if alt_best_ask > alt_best_bid:
-                                        logger.info(f"Fixed order book using strategy: {strategy}")
-                                        logger.info(f"Corrected: bid={alt_best_bid}, ask={alt_best_ask}")
-                                        bids = alt_bids
-                                        asks = alt_asks
-                                        best_bid = alt_best_bid
-                                        best_ask = alt_best_ask
-                                        break
-                            except (IndexError, ValueError, TypeError) as e:
-                                logger.debug(f"Strategy '{strategy}' failed: {e}")
-                        else:
-                            # If no fix worked, skip this update
-                            logger.warning("Could not fix inverted order book, skipping this update")
+                    # Try swapping bid/ask arrays first
+                    if len(asks) > 0 and len(bids) > 0:
+                        try:
+                            alt_best_bid = float(asks[0][0])
+                            alt_best_ask = float(bids[0][0])
+                            
+                            if alt_best_ask > alt_best_bid:
+                                logger.info(f"Fixed order book by swapping: bid={alt_best_bid}, ask={alt_best_ask}")
+                                bids, asks = asks, bids
+                                best_bid, best_ask = alt_best_bid, alt_best_ask
+                            else:
+                                logger.warning("Could not fix order book, skipping this update")
+                                return
+                        except Exception as e:
+                            logger.warning(f"Failed to fix order book: {e}")
                             return
+                    else:
+                        logger.warning("Insufficient data to fix order book")
+                        return
+                
+            except (IndexError, ValueError, TypeError) as e:
+                logger.error(f"Error parsing order book data: {e}")
+                return
+
+            # Update current price
+            mid_price = (best_bid + best_ask) / 2.0
+            self.current_price = mid_price
+            self.price_history.append(mid_price)
+            
+            # Update market regime
+            self.market_regime = self.detect_market_regime()
+            
+            # Enhanced debugging for each filter
+            logger.debug(f"Market check - Price: {mid_price:.4f}, Regime: {self.market_regime}")
+            
+            # Time filter check
+            if not self.is_good_trading_time():
+                current_hour = datetime.now(timezone.utc).hour
+                logger.debug(f"Time filter failed - Current hour: {current_hour}")
+                return
+            
+            # Order book depth analysis
+            depth_ok, depth_ratio = self.analyze_order_book_depth(bids, asks)
+            if not depth_ok:
+                logger.debug(f"Depth check failed - Ratio: {depth_ratio:.2f}")
+                return
+            
+            # Enhanced spread analysis
+            spread_ok, spread, spread_volatility = self.analyze_spread_quality(bids, asks)
+            if not spread_ok:
+                logger.debug(f"Spread check failed - Spread: {spread:.6f} ({spread*100:.3f}%), Required: {MIN_SPREAD*100:.3f}%")
+                return
+            
+            # Calculate confidence score
+            self.confidence_score = self.calculate_confidence_score(spread, depth_ratio, self.market_regime)
+            
+            # Require minimum confidence for entry
+            min_confidence = 0.6
+            if self.market_regime == "HIGH_VOL":
+                min_confidence = 0.7
+            
+            if self.confidence_score < min_confidence:
+                logger.debug(f"Confidence too low: {self.confidence_score:.2f} < {min_confidence}")
+                return
+            
+            # Balance checks with detailed logging
+            usdt_free = self.get_asset_free(self.quote_asset)
+            desired_qty = self.calculate_position_size(self.confidence_score)
+            required_quote = best_ask * desired_qty * 1.02  # 2% buffer
+            
+            logger.info(f"Entry conditions met!")
+            logger.info(f"  Spread: {spread*100:.3f}% (required: {MIN_SPREAD*100:.3f}%)")
+            logger.info(f"  Confidence: {self.confidence_score:.2f}")
+            logger.info(f"  Depth ratio: {depth_ratio:.2f}")
+            logger.info(f"  Market regime: {self.market_regime}")
+            logger.info(f"  Balance check: {usdt_free:.2f} USDT available, {required_quote:.2f} required")
+            
+            if usdt_free < required_quote:
+                logger.warning(f"Insufficient {self.quote_asset} balance: {usdt_free:.2f} < {required_quote:.2f}")
+                return
+
+            if not self.notional_ok(best_ask, desired_qty):
+                logger.warning(f"NOTIONAL check failed: {best_ask} * {desired_qty} < {self.min_notional}")
+                return
+
+            # Store spread for logging
+            self.spread_at_entry = spread
+
+            # Place BUY order
+            logger.info(f"🚀 PLACING BUY ORDER: {desired_qty} BNB @ ~{best_ask:.4f}")
+            entry_price, filled_qty = self.place_order(Client.SIDE_BUY, desired_qty)
+            
+            if entry_price and filled_qty > 0:
+                self.trade_active = True
+                self.entry_price = entry_price
+                self.position_qty = self.format_quantity(filled_qty)
+                self.highest_price_since_entry = entry_price
+
+                self.target_price = self.format_price(entry_price * (1 + PROFIT_TARGET))
+                self.stop_price = self.format_price(entry_price * (1 - STOP_LOSS))
+                self.original_stop_price = self.stop_price
+
+                msg = (
+                    f"📈 BNB ENTRY EXECUTED\n"
+                    f"💰 Price: {self.entry_price:.4f}\n"
+                    f"🔢 Qty: {self.position_qty}\n"
+                    f"🎯 Target: {self.target_price:.4f} (+{PROFIT_TARGET*100:.2f}%)\n"
+                    f"🛑 Stop: {self.stop_price:.4f} (-{STOP_LOSS*100:.2f}%)\n"
+                    f"📊 Confidence: {self.confidence_score:.1%}\n"
+                    f"🌡️ Regime: {self.market_regime}\n"
+                    f"📈 Spread: {spread:.4%}\n"
+                    f"⭐ Step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}"
+                )
+                logger.info(msg.replace('\n', ' | '))
+                self.send_telegram(msg)
+            else:
+                logger.error("❌ Order placement failed!")
+
+        except Exception as e:
+            logger.error(f"Error in enhanced depth handler: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+        def handle_trade_data(self, data):
+            """Enhanced trade stream handler with trailing stops"""
+            try:
+                price = float(data["p"])
+                self.current_price = price
+                self.price_history.append(price)
+
+                if not self.trade_active:
+                    return
+
+                # Update trailing stop
+                self.update_trailing_stop()
+
+                take_profit = price >= self.target_price
+                stop_loss = price <= self.stop_price
+
+                if not (take_profit or stop_loss):
+                    return
+
+                # Enhanced exit logic
+                base_free = self.get_asset_free(self.base_asset)
+                sellable = min(self.position_qty, base_free) * 0.995
+                sell_qty = self.format_quantity(sellable)
+
+                min_check = self.market_min_qty if self.market_min_qty else self.min_qty
+                if min_check is not None and sell_qty < min_check:
+                    logger.warning(f"Sell qty {sell_qty} below market minQty {min_check}")
+                    sell_qty = self.format_quantity(base_free * 0.99)
+                    if sell_qty < min_check:
+                        logger.error(f"Cannot sell: available {base_free} results in qty {sell_qty} < minQty {min_check}")
+                        return
+
+                if self.min_notional and (price * sell_qty) < self.min_notional:
+                    logger.error(f"Sell would violate MIN_NOTIONAL: {price * sell_qty:.8f} < {self.min_notional}")
+                    return
+
+                exit_price, exec_qty = self.place_order(Client.SIDE_SELL, sell_qty)
+                if exit_price and exec_qty > 0:
+                    # ORIGINAL calculation (before fees)
+                    gross_pct = ((exit_price - self.entry_price) / self.entry_price) * 100.0
                     
-                except (IndexError, ValueError, TypeError) as e:
-                    logger.error(f"Error parsing order book data: {e}")
-                    logger.debug(f"Bids sample: {bids[:2] if len(bids) > 0 else 'empty'}")
-                    logger.debug(f"Asks sample: {asks[:2] if len(asks) > 0 else 'empty'}")
-                    return
-
-                # Update current price
-                mid_price = (best_bid + best_ask) / 2.0
-                self.current_price = mid_price
-                self.price_history.append(mid_price)
-                
-                # Update market regime
-                self.market_regime = self.detect_market_regime()
-                
-                # Time filter check
-                if not self.is_good_trading_time():
-                    logger.debug("Time filter: not good trading time")
-                    return
-                
-                # Order book depth analysis
-                depth_ok, depth_ratio = self.analyze_order_book_depth(bids, asks)
-                if not depth_ok:
-                    logger.debug("Order book depth check failed")
-                    return
-                
-                # Enhanced spread analysis (now with fixed data)
-                spread_ok, spread, spread_volatility = self.analyze_spread_quality(bids, asks)
-                if not spread_ok:
-                    logger.debug(f"Spread quality check failed: spread={spread:.6f}")
-                    return
-                
-                # Calculate confidence score
-                self.confidence_score = self.calculate_confidence_score(spread, depth_ratio, self.market_regime)
-                
-                # Require minimum confidence for entry
-                min_confidence = 0.6
-                if self.market_regime == "HIGH_VOL":
-                    min_confidence = 0.7  # Higher confidence required in volatile markets
-                
-                if self.confidence_score < min_confidence:
-                    logger.debug(f"Confidence too low: {self.confidence_score:.2f} < {min_confidence}")
-                    return
-                
-                logger.info(f"Entry signal: spread={spread:.6f}, confidence={self.confidence_score:.2f}, "
-                        f"regime={self.market_regime}, depth_ratio={depth_ratio:.2f}")
-
-                # Calculate position size
-                desired_qty = self.calculate_position_size(self.confidence_score)
-                
-                # Balance checks
-                usdt_free = self.get_asset_free(self.quote_asset)
-                required_quote = best_ask * desired_qty * 1.02
-                if usdt_free < required_quote:
-                    logger.warning(f"Insufficient {self.quote_asset} balance: {usdt_free} < {required_quote}")
-                    return
-
-                if not self.notional_ok(best_ask, desired_qty):
-                    logger.warning(f"NOTIONAL check failed: {best_ask} * {desired_qty} < {self.min_notional}")
-                    return
-
-                # Place BUY order
-                entry_price, filled_qty = self.place_order(Client.SIDE_BUY, desired_qty)
-                if entry_price and filled_qty > 0:
-                    self.trade_active = True
-                    self.entry_price = entry_price
-                    self.position_qty = self.format_quantity(filled_qty)
-                    self.highest_price_since_entry = entry_price
-
-                    self.target_price = self.format_price(entry_price * (1 + PROFIT_TARGET))
-                    self.stop_price = self.format_price(entry_price * (1 - STOP_LOSS))
-                    self.original_stop_price = self.stop_price
-
-                    msg = (
-                        f"📈 ENHANCED ENTRY\n"
-                        f"💰 Price: {self.entry_price:.6f}\n"
-                        f"🔢 Qty: {self.position_qty}\n"
-                        f"🎯 TP: {self.target_price:.6f}\n"
-                        f"🛑 SL: {self.stop_price:.6f}\n"
-                        f"📊 Confidence: {self.confidence_score:.1%}\n"
-                        f"🌡️ Regime: {self.market_regime}\n"
-                        f"📈 Spread: {spread:.4%}\n"
-                        f"🎛️ Step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}"
-                    )
-                    logger.info(msg.replace('\n', ' | '))
-                    self.send_telegram(msg)
+                    # NEW: Calculate fees (estimate 0.2% round trip)
+                    fee_rate = 0.002  # 0.2% for round trip
+                    
+                    # Check if using BNB discount
+                    try:
+                        bnb_balance = self.get_asset_free('BNB')
+                        if bnb_balance >= 0.1:
+                            fee_rate = 0.0015  # 25% discount = 0.15% round trip
+                            logger.info("Using BNB fee discount")
+                    except:
+                        pass
+                    
+                    # Calculate net P&L after fees
+                    net_pct = gross_pct - (fee_rate * 100)
+                    
+                    # Use net P&L for logging and display
+                    pct = net_pct
+                    
+                    # Determine exit reason
+                    if take_profit:
+                        reason = 'profit_target'
+                    elif price <= self.original_stop_price:
+                        reason = 'stop_loss'
+                    else:
+                        reason = 'trailing_stop'
+                    
+                    # Log the trade
+                    try:
+                        self.trade_logger.log_trade(
+                            symbol=SYMBOL,
+                            side='BUY',
+                            entry_price=self.entry_price,
+                            exit_price=exit_price,
+                            quantity=self.position_qty,
+                            pnl_pct=pct / 100.0,
+                            martingale_step=self.martingale_step,
+                            reason=reason,
+                            spread_at_entry=self.spread_at_entry
+                        )
+                    except Exception as log_error:
+                        logger.error(f"Failed to log trade: {log_error}")
+                    
+                    # Enhanced exit message
+                    if take_profit:
+                        msg = f"🎯 PROFIT TARGET HIT!"
+                    elif reason == 'trailing_stop':
+                        msg = f"📈 TRAILING STOP HIT!"
+                    else:
+                        msg = f"🛑 STOP LOSS HIT!"
+                    
+                    msg += (f"\n💰 Sold @ {exit_price:.6f}"
+                        f"\n📊 P/L: {pct:.2f}%"
+                        f"\n🎯 Confidence was: {self.confidence_score:.1%}"
+                        f"\n🌡️ Market: {self.market_regime}")
+                    
+                    try:
+                        if take_profit:
+                            self.apply_martingale('profit')
+                        else:
+                            self.apply_martingale('loss')
+                    except Exception as e:
+                        logger.error(f"Post-sell handling error: {e}")
+                    finally:
+                        logger.info(msg.replace('\n', ' | '))
+                        self.send_telegram(msg)
+                        self.reset_trade_state()
+                        
+                        # Dynamic cooldown based on outcome
+                        if take_profit:
+                            self.set_cooldown(COOLDOWN_SECONDS // 2)  # Shorter cooldown after profit
+                        else:
+                            self.set_cooldown(COOLDOWN_SECONDS)  # Normal cooldown after loss
 
             except Exception as e:
-                logger.error(f"Error in enhanced depth handler: {e}")
-                import traceback
-                logger.debug(traceback.format_exc())
+                logger.error(f"Error in enhanced trade handler: {e}")
 
+        # ---------- All other methods remain the same ----------
+        
+        def now(self):
+            return time.time()
 
-    def handle_trade_data(self, data):
-        """Enhanced trade stream handler with trailing stops"""
-        try:
-            price = float(data["p"])
-            self.current_price = price
-            self.price_history.append(price)
+        def in_cooldown(self):
+            return self.now() < self.cooldown_until
 
-            if not self.trade_active:
+        def set_cooldown(self, seconds=None):
+            if seconds is None:
+                seconds = COOLDOWN_SECONDS
+            if seconds > 0:
+                self.cooldown_until = self.now() + seconds
+
+        def notional_ok(self, price, qty):
+            if self.min_notional is None:
+                return True
+            return (price * qty) >= self.min_notional
+
+        def get_asset_free(self, asset):
+            try:
+                bal = self.client.get_asset_balance(asset=asset)
+                if bal and 'free' in bal:
+                    return float(bal['free'])
+            except Exception:
+                pass
+            return self.get_account_balance(asset)
+
+        def format_quantity(self, quantity):
+            q = Decimal(str(quantity))
+            fmt = Decimal('0.' + '0' * self.quantity_precision) if self.quantity_precision > 0 else Decimal('0')
+            return float(q.quantize(fmt, rounding=ROUND_DOWN))
+
+        def format_price(self, price):
+            p = Decimal(str(price))
+            fmt = Decimal('0.' + '0' * self.price_precision) if self.price_precision > 0 else Decimal('0')
+            return float(p.quantize(fmt, rounding=ROUND_DOWN))
+
+        def send_telegram(self, msg):
+            if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+                logger.info(f"[Telegram Disabled] {msg}")
                 return
 
-            # Update trailing stop
-            self.update_trailing_stop()
-
-            take_profit = price >= self.target_price
-            stop_loss = price <= self.stop_price
-
-            if not (take_profit or stop_loss):
-                return
-
-            # Enhanced exit logic
-            base_free = self.get_asset_free(self.base_asset)
-            sellable = min(self.position_qty, base_free) * 0.995
-            sell_qty = self.format_quantity(sellable)
-
-            min_check = self.market_min_qty if self.market_min_qty else self.min_qty
-            if min_check is not None and sell_qty < min_check:
-                logger.warning(f"Sell qty {sell_qty} below market minQty {min_check}")
-                sell_qty = self.format_quantity(base_free * 0.99)
-                if sell_qty < min_check:
-                    logger.error(f"Cannot sell: available {base_free} results in qty {sell_qty} < minQty {min_check}")
-                    return
-
-            if self.min_notional and (price * sell_qty) < self.min_notional:
-                logger.error(f"Sell would violate MIN_NOTIONAL: {price * sell_qty:.8f} < {self.min_notional}")
-                return
-
-            exit_price, exec_qty = self.place_order(Client.SIDE_SELL, sell_qty)
-            if exit_price and exec_qty > 0:
-                # ORIGINAL calculation (before fees)
-                gross_pct = ((exit_price - self.entry_price) / self.entry_price) * 100.0
-                
-                # NEW: Calculate fees (estimate 0.2% round trip)
-                fee_rate = 0.002  # 0.2% for round trip
-                
-                # Check if using BNB discount
-                try:
-                    bnb_balance = self.get_asset_free('BNB')
-                    if bnb_balance >= 0.1:
-                        fee_rate = 0.0015  # 25% discount = 0.15% round trip
-                        logger.info("Using BNB fee discount")
-                except:
-                    pass
-                
-                # Calculate net P&L after fees
-                net_pct = gross_pct - (fee_rate * 100)
-                
-                # Use net P&L for logging and display
-                pct = net_pct
-                
-                # Determine exit reason
-                if take_profit:
-                    reason = 'profit_target'
-                elif price <= self.original_stop_price:
-                    reason = 'stop_loss'
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+            try:
+                response = requests.post(url, data=payload, timeout=5)
+                if response.status_code == 200:
+                    logger.info(f"[Telegram Sent] {msg}")
                 else:
-                    reason = 'trailing_stop'
+                    logger.warning(f"[Telegram Failed] Status: {response.status_code}")
+            except Exception as e:
+                logger.error(f"[Telegram Error] {e}")
+
+        def get_account_balance(self, asset="USDT"):
+            try:
+                account = self.client.get_account()
+                for balance in account['balances']:
+                    if balance['asset'] == asset:
+                        return float(balance['free'])
+                return 0.0
+            except Exception as e:
+                logger.error(f"Failed to get balance: {e}")
+                return 0.0
+
+        def place_order(self, side, quantity):
+            try:
+                formatted_qty = self.format_quantity(quantity)
+
+                min_check = self.market_min_qty if self.market_min_qty else self.min_qty
+                max_check = self.market_max_qty if self.market_max_qty else self.max_qty
+
+                if min_check is not None and formatted_qty < min_check:
+                    logger.error(f"Quantity {formatted_qty} below minimum {min_check}")
+                    return (None, 0.0)
                 
-                # Log the trade
-                try:
-                    self.trade_logger.log_trade(
-                        symbol=SYMBOL,
-                        side='BUY',
-                        entry_price=self.entry_price,
-                        exit_price=exit_price,
-                        quantity=self.position_qty,
-                        pnl_pct=pct / 100.0,
-                        martingale_step=self.martingale_step,
-                        reason=reason,
-                        spread_at_entry=self.spread_at_entry
-                    )
-                except Exception as log_error:
-                    logger.error(f"Failed to log trade: {log_error}")
-                
-                # Enhanced exit message
-                if take_profit:
-                    msg = f"🎯 PROFIT TARGET HIT!"
-                elif reason == 'trailing_stop':
-                    msg = f"📈 TRAILING STOP HIT!"
+                if max_check is not None and formatted_qty > max_check:
+                    logger.error(f"Quantity {formatted_qty} above maximum {max_check}")
+                    return (None, 0.0)
+
+                logger.info(f"Placing {side} order: {formatted_qty} {SYMBOL}")
+
+                order = self.client.order_market(
+                    symbol=SYMBOL,
+                    side=side,
+                    quantity=formatted_qty
+                )
+
+                total_qty = 0.0
+                total_cost = 0.0
+                for fill in order.get("fills", []):
+                    fq = float(fill["qty"])
+                    fp = float(fill["price"])
+                    total_qty += fq
+                    total_cost += fq * fp
+
+                executed_qty = float(order.get("executedQty", total_qty) or 0.0)
+                avg_price = (total_cost / total_qty) if total_qty > 0 else float(order.get("price", 0.0))
+
+                logger.info(f"Order filled: {side} {executed_qty} {SYMBOL} @ {avg_price:.6f}")
+                self.send_telegram(f"✅ {side} {executed_qty} {SYMBOL} @ {avg_price:.6f}")
+
+                return (avg_price, executed_qty)
+
+            except Exception as e:
+                error_msg = f"Order error ({side}): {str(e)}"
+                logger.error(error_msg)
+                self.send_telegram(f"❌ {error_msg}")
+                return (None, 0.0)
+
+        def reset_trade_state(self):
+            self.trade_active = False
+            self.entry_price = 0.0
+            self.target_price = 0.0
+            self.stop_price = 0.0
+            self.position_qty = 0.0
+            self.original_stop_price = 0.0
+            self.highest_price_since_entry = 0.0
+            self.confidence_score = 0.0
+
+        def apply_martingale(self, outcome: str):
+            if not MARTINGALE_ENABLED:
+                self.current_qty = self.base_qty
+                self.martingale_step = 0
+                return
+
+            if outcome == 'profit':
+                self.current_qty = self.base_qty
+                self.martingale_step = 0
+            else:
+                if self.martingale_step < MARTINGALE_MAX_STEPS:
+                    self.martingale_step += 1
+                    self.current_qty = self.base_qty * (MARTINGALE_MULTIPLIER ** self.martingale_step)
                 else:
-                    msg = f"🛑 STOP LOSS HIT!"
-                
-                msg += (f"\n💰 Sold @ {exit_price:.6f}"
-                       f"\n📊 P/L: {pct:.2f}%"
-                       f"\n🎯 Confidence was: {self.confidence_score:.1%}"
-                       f"\n🌡️ Market: {self.market_regime}")
-                
-                try:
-                    if take_profit:
-                        self.apply_martingale('profit')
+                    cap_msg = (f"🛑 Martingale cap reached (step={self.martingale_step}). "
+                            f"{'Trading paused.' if HALT_ON_MAX_STEPS else f'Extended cooldown {EXTENDED_COOLDOWN_SECONDS}s.'}")
+                    logger.warning(cap_msg)
+                    self.send_telegram(cap_msg)
+                    if HALT_ON_MAX_STEPS:
+                        self.trading_paused = True
                     else:
-                        self.apply_martingale('loss')
-                except Exception as e:
-                    logger.error(f"Post-sell handling error: {e}")
-                finally:
-                    logger.info(msg.replace('\n', ' | '))
-                    self.send_telegram(msg)
-                    self.reset_trade_state()
+                        self.set_cooldown(EXTENDED_COOLDOWN_SECONDS)
+
+            logger.info(f"[Martingale] outcome={outcome} step={self.martingale_step} next_qty={self.current_qty}")
+
+        def _get_symbol_info(self):
+                """Get symbol information from exchange"""
+                try:
+                    exchange_info = self.client.get_exchange_info()
+                    for symbol in exchange_info['symbols']:
+                        if symbol['symbol'] == SYMBOL:
+                            self.symbol_info = symbol
+                            self.base_asset = symbol['baseAsset']
+                            self.quote_asset = symbol['quoteAsset']
+                            self.min_notional = None
+                            self.max_qty = None
+                            self.market_min_qty = None
+                            self.market_max_qty = None
+                            self.max_num_orders = None
+
+                            for f in symbol['filters']:
+                                ftype = f['filterType']
+                                if ftype == 'PRICE_FILTER':
+                                    tick_size = f['tickSize']
+                                    self.price_precision = len(tick_size.rstrip('0').split('.')[1]) if '.' in tick_size else 0
+                                elif ftype == 'LOT_SIZE':
+                                    step_size = f['stepSize']
+                                    self.quantity_precision = len(step_size.rstrip('0').split('.')[1]) if '.' in step_size else 0
+                                    self.min_qty = float(f['minQty'])
+                                    self.max_qty = float(f.get('maxQty', 0)) if f.get('maxQty') != '9000000000' else None
+                                elif ftype == 'MARKET_LOT_SIZE':
+                                    self.market_min_qty = float(f['minQty'])
+                                    self.market_max_qty = float(f.get('maxQty', 0)) if f.get('maxQty') != '9000000000' else None
+                                elif ftype in ('MIN_NOTIONAL', 'NOTIONAL'):
+                                    self.min_notional = float(f.get('minNotional') or f.get('notional') or 0.0)
+                                elif ftype == 'MAX_NUM_ORDERS':
+                                    self.max_num_orders = int(f.get('maxNumOrders', 200))
+
+                            logger.info(
+                                f"Enhanced Symbol info: {SYMBOL} | "
+                                f"price_precision={self.price_precision}, qty_precision={self.quantity_precision}, "
+                                f"min_qty={self.min_qty}, min_notional={self.min_notional}"
+                            )
+                            return  # Successfully found and configured symbol
                     
-                    # Dynamic cooldown based on outcome
-                    if take_profit:
-                        self.set_cooldown(COOLDOWN_SECONDS // 2)  # Shorter cooldown after profit
-                    else:
-                        self.set_cooldown(COOLDOWN_SECONDS)  # Normal cooldown after loss
-
-        except Exception as e:
-            logger.error(f"Error in enhanced trade handler: {e}")
-
-    # ---------- All other methods remain the same ----------
-    
-    def now(self):
-        return time.time()
-
-    def in_cooldown(self):
-        return self.now() < self.cooldown_until
-
-    def set_cooldown(self, seconds=None):
-        if seconds is None:
-            seconds = COOLDOWN_SECONDS
-        if seconds > 0:
-            self.cooldown_until = self.now() + seconds
-
-    def notional_ok(self, price, qty):
-        if self.min_notional is None:
-            return True
-        return (price * qty) >= self.min_notional
-
-    def get_asset_free(self, asset):
-        try:
-            bal = self.client.get_asset_balance(asset=asset)
-            if bal and 'free' in bal:
-                return float(bal['free'])
-        except Exception:
-            pass
-        return self.get_account_balance(asset)
-
-    def format_quantity(self, quantity):
-        q = Decimal(str(quantity))
-        fmt = Decimal('0.' + '0' * self.quantity_precision) if self.quantity_precision > 0 else Decimal('0')
-        return float(q.quantize(fmt, rounding=ROUND_DOWN))
-
-    def format_price(self, price):
-        p = Decimal(str(price))
-        fmt = Decimal('0.' + '0' * self.price_precision) if self.price_precision > 0 else Decimal('0')
-        return float(p.quantize(fmt, rounding=ROUND_DOWN))
-
-    def send_telegram(self, msg):
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            logger.info(f"[Telegram Disabled] {msg}")
-            return
-
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-        try:
-            response = requests.post(url, data=payload, timeout=5)
-            if response.status_code == 200:
-                logger.info(f"[Telegram Sent] {msg}")
-            else:
-                logger.warning(f"[Telegram Failed] Status: {response.status_code}")
-        except Exception as e:
-            logger.error(f"[Telegram Error] {e}")
-
-    def get_account_balance(self, asset="USDT"):
-        try:
-            account = self.client.get_account()
-            for balance in account['balances']:
-                if balance['asset'] == asset:
-                    return float(balance['free'])
-            return 0.0
-        except Exception as e:
-            logger.error(f"Failed to get balance: {e}")
-            return 0.0
-
-    def place_order(self, side, quantity):
-        try:
-            formatted_qty = self.format_quantity(quantity)
-
-            min_check = self.market_min_qty if self.market_min_qty else self.min_qty
-            max_check = self.market_max_qty if self.market_max_qty else self.max_qty
-
-            if min_check is not None and formatted_qty < min_check:
-                logger.error(f"Quantity {formatted_qty} below minimum {min_check}")
-                return (None, 0.0)
-            
-            if max_check is not None and formatted_qty > max_check:
-                logger.error(f"Quantity {formatted_qty} above maximum {max_check}")
-                return (None, 0.0)
-
-            logger.info(f"Placing {side} order: {formatted_qty} {SYMBOL}")
-
-            order = self.client.order_market(
-                symbol=SYMBOL,
-                side=side,
-                quantity=formatted_qty
-            )
-
-            total_qty = 0.0
-            total_cost = 0.0
-            for fill in order.get("fills", []):
-                fq = float(fill["qty"])
-                fp = float(fill["price"])
-                total_qty += fq
-                total_cost += fq * fp
-
-            executed_qty = float(order.get("executedQty", total_qty) or 0.0)
-            avg_price = (total_cost / total_qty) if total_qty > 0 else float(order.get("price", 0.0))
-
-            logger.info(f"Order filled: {side} {executed_qty} {SYMBOL} @ {avg_price:.6f}")
-            self.send_telegram(f"✅ {side} {executed_qty} {SYMBOL} @ {avg_price:.6f}")
-
-            return (avg_price, executed_qty)
-
-        except Exception as e:
-            error_msg = f"Order error ({side}): {str(e)}"
-            logger.error(error_msg)
-            self.send_telegram(f"❌ {error_msg}")
-            return (None, 0.0)
-
-    def reset_trade_state(self):
-        self.trade_active = False
-        self.entry_price = 0.0
-        self.target_price = 0.0
-        self.stop_price = 0.0
-        self.position_qty = 0.0
-        self.original_stop_price = 0.0
-        self.highest_price_since_entry = 0.0
-        self.confidence_score = 0.0
-
-    def apply_martingale(self, outcome: str):
-        if not MARTINGALE_ENABLED:
-            self.current_qty = self.base_qty
-            self.martingale_step = 0
-            return
-
-        if outcome == 'profit':
-            self.current_qty = self.base_qty
-            self.martingale_step = 0
-        else:
-            if self.martingale_step < MARTINGALE_MAX_STEPS:
-                self.martingale_step += 1
-                self.current_qty = self.base_qty * (MARTINGALE_MULTIPLIER ** self.martingale_step)
-            else:
-                cap_msg = (f"🛑 Martingale cap reached (step={self.martingale_step}). "
-                        f"{'Trading paused.' if HALT_ON_MAX_STEPS else f'Extended cooldown {EXTENDED_COOLDOWN_SECONDS}s.'}")
-                logger.warning(cap_msg)
-                self.send_telegram(cap_msg)
-                if HALT_ON_MAX_STEPS:
-                    self.trading_paused = True
-                else:
-                    self.set_cooldown(EXTENDED_COOLDOWN_SECONDS)
-
-        logger.info(f"[Martingale] outcome={outcome} step={self.martingale_step} next_qty={self.current_qty}")
-
-    def _get_symbol_info(self):
-        try:
-            exchange_info = self.client.get_exchange_info()
-            for symbol in exchange_info['symbols']:
-                if symbol['symbol'] == SYMBOL:
-                    self.symbol_info = symbol
-                    self.base_asset = symbol['baseAsset']
-                    self.quote_asset = symbol['quoteAsset']
-                    self.min_notional = None
-                    self.max_qty = None
-                    self.market_min_qty = None
-                    self.market_max_qty = None
-                    self.max_num_orders = None
-
-                    for f in symbol['filters']:
-                        ftype = f['filterType']
-                        if ftype == 'PRICE_FILTER':
-                            tick_size = f['tickSize']
-                            self.price_precision = len(tick_size.rstrip('0').split('.')[1]) if '.' in tick_size else 0
-                        elif ftype == 'LOT_SIZE':
-                            step_size = f['stepSize']
-                            self.quantity_precision = len(step_size.rstrip('0').split('.')[1]) if '.' in step_size else 0
-                            self.min_qty = float(f['minQty'])
-                            self.max_qty = float(f.get('maxQty', 0)) if f.get('maxQty') != '9000000000' else None
-                        elif ftype == 'MARKET_LOT_SIZE':
-                            self.market_min_qty = float(f['minQty'])
-                            self.market_max_qty = float(f.get('maxQty', 0)) if f.get('maxQty') != '9000000000' else None
-                        elif ftype in ('MIN_NOTIONAL', 'NOTIONAL'):
-                            self.min_notional = float(f.get('minNotional') or f.get('notional') or 0.0)
-                        elif ftype == 'MAX_NUM_ORDERS':
-                            self.max_num_orders = int(f.get('maxNumOrders', 200))
-
-                    logger.info(
-                        f"Enhanced Symbol info: {SYMBOL} | "
-                        f"price_precision={self.price_precision}, qty_precision={self.quantity_precision}, "
-                        f"min_qty={self.min_qty}, min_notional={self.min_notional}"
-                    )
-                    break
-        except Exception as e:
-            logger.error(f"Failed to get symbol info: {e}")
-
-    # WebSocket methods remain the same as original...
+                    # If we get here, symbol wasn't found
+                    logger.error(f"Symbol {SYMBOL} not found in exchange info")
+                    raise Exception(f"Symbol {SYMBOL} not found")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to get symbol info: {e}")
+                    # Set default values to prevent crashes
+                    self.symbol_info = None
+                    self.base_asset = SYMBOL.replace('USDT', '')
+                    self.quote_asset = 'USDT'
+                    self.price_precision = 4
+                    self.quantity_precision = 5
+                    self.min_qty = 0.001
+                    self.min_notional = 5.0
+                    raise e
+                    
+            # WebSocket methods remain the same as original...
     def on_error(self, ws, error):
         logger.error(f"WebSocket error: {error}")
         self.send_telegram(f"⚠️ WebSocket error: {error}")
@@ -1015,7 +1030,7 @@ class EnhancedBinanceScalper:
 
             if self.trade_active:
                 warning_msg = (f"⚠️ Enhanced Scalper stopped with active trade!\n"
-                             f"Entry: {self.entry_price:.6f} | Current: {self.current_price:.6f}")
+                            f"Entry: {self.entry_price:.6f} | Current: {self.current_price:.6f}")
                 logger.warning(warning_msg.replace('\n', ' | '))
                 self.send_telegram(warning_msg)
 
@@ -1211,27 +1226,27 @@ def place_order(self, side, quantity):
         logger.info(f"Fee Test: Gross {gross_profit:.4f} - Fees {fees:.4f} = Net {net_profit:.4f}")
         return net_profit
 
-def main():
-    """Main function with enhanced validation"""
-    if not API_KEY or not API_SECRET:
-        logger.error("❌ Missing required API credentials")
-        return
+    def main():
+        """Main function with enhanced validation"""
+        if not API_KEY or not API_SECRET:
+            logger.error("❌ Missing required API credentials")
+            return
 
-    # Validate enhanced parameters
-    logger.info("🔍 Validating enhanced parameters...")
-    
-    if MIN_SPREAD < 0.001:
-        logger.warning(f"⚠️ MIN_SPREAD very low: {MIN_SPREAD}")
-    if PROFIT_TARGET <= STOP_LOSS:
-        logger.warning(f"⚠️ Risk/Reward ratio concerning: TP={PROFIT_TARGET} SL={STOP_LOSS}")
-    if MIN_BOOK_DEPTH < 100:
-        logger.warning(f"⚠️ MIN_BOOK_DEPTH very low: {MIN_BOOK_DEPTH}")
+        # Validate enhanced parameters
+        logger.info("🔍 Validating enhanced parameters...")
+        
+        if MIN_SPREAD < 0.001:
+            logger.warning(f"⚠️ MIN_SPREAD very low: {MIN_SPREAD}")
+        if PROFIT_TARGET <= STOP_LOSS:
+            logger.warning(f"⚠️ Risk/Reward ratio concerning: TP={PROFIT_TARGET} SL={STOP_LOSS}")
+        if MIN_BOOK_DEPTH < 100:
+            logger.warning(f"⚠️ MIN_BOOK_DEPTH very low: {MIN_BOOK_DEPTH}")
 
-    try:
-        scalper = EnhancedBinanceScalper()
-        scalper.run()
-    except Exception as e:
-        logger.error(f"Failed to start enhanced scalper: {e}")
+        try:
+            scalper = EnhancedBinanceScalper()
+            scalper.run()
+        except Exception as e:
+            logger.error(f"Failed to start enhanced scalper: {e}")
 
 
 if __name__ == "__main__":
