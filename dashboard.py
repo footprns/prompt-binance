@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Trading Dashboard - Fixed Version with Correct Paths
+Trading Dashboard - Complete Enhanced Version with Dynamic Service Discovery
 """
 
 from flask import Flask, render_template, jsonify
@@ -13,6 +13,7 @@ import plotly.utils
 import subprocess
 import os
 import logging
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -96,30 +97,75 @@ class DashboardData:
             logger.error(f"Database error: {e}")
             return {'error': f'Database error: {str(e)}'}
     
+    def discover_active_scalper_services(self):
+        """Dynamically discover all running scalper services"""
+        active_services = {}
+        
+        try:
+            # Method 1: Use systemctl to list all services
+            result = subprocess.run(
+                [self.systemctl_path, 'list-units', '--type=service', '--state=active', '--no-pager'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                lines = result.stdout.split('\n')
+                for line in lines:
+                    # Look for binance-scalper@ services
+                    match = re.search(r'binance-scalper@(\w+)\.service', line)
+                    if match:
+                        symbol = match.group(1).upper()
+                        active_services[symbol] = 'Running'
+            
+            # Method 2: Check for specific common symbols if method 1 fails
+            if not active_services:
+                common_symbols = [
+                    'btcusdt', 'ethusdt', 'bnbusdt', 'adausdt', 'xrpusdt', 
+                    'dogeusdt', 'shibusdt', 'arbusdt', 'pepeusdt', 'ltcusdt',
+                    'solusdt', 'maticusdt', 'avaxusdt', 'linkusdt', 'dotusdt'
+                ]
+                
+                for symbol in common_symbols:
+                    service_name = f'binance-scalper@{symbol}'
+                    status = self._check_service_status(service_name)
+                    if status in ['active', 'running']:
+                        active_services[symbol.upper()] = 'Running'
+                    elif status in ['failed', 'inactive']:
+                        active_services[symbol.upper()] = status.title()
+            
+            # Method 3: Check configs directory for additional symbols
+            try:
+                configs_dir = "/home/ubuntu/binance_scalper/configs"
+                if os.path.exists(configs_dir):
+                    for config_file in os.listdir(configs_dir):
+                        if config_file.endswith('.env') and config_file != '.env_template':
+                            symbol = config_file.replace('.env', '').upper()
+                            if symbol not in active_services:
+                                service_name = f'binance-scalper@{symbol.lower()}'
+                                status = self._check_service_status(service_name)
+                                if status in ['active', 'running']:
+                                    active_services[symbol] = 'Running'
+                                elif status in ['failed', 'inactive', 'stopped']:
+                                    active_services[symbol] = status.title()
+            except Exception as e:
+                logger.debug(f"Could not check configs directory: {e}")
+            
+        except Exception as e:
+            logger.error(f"Error discovering services: {e}")
+        
+        return active_services
+    
     def get_system_status(self):
-        """Get system status with multiple fallback methods"""
+        """Get system status with dynamic service discovery"""
         try:
             # Check AI agent status
             ai_status = self._check_service_status('binance-ai-agent')
             
-            # Check active trading services
-            active_traders = []
-            trader_details = {}
-            
-            for symbol in ['btcusdt', 'ethusdt', 'arbusdt', 'shibusdt', 'adausdt', 'dogeusdt', 'xrpusdt', 'bnbusdt', 'pepeusdt']:
-            # Added PEPEUSDT
-                service_name = f'binance-scalper@{symbol}'
-                status = self._check_service_status(service_name)
-                
-                if status == 'active':
-                    active_traders.append(symbol.upper())
-                    trader_details[symbol.upper()] = 'Running'
-                elif status == 'failed':
-                    trader_details[symbol.upper()] = 'Failed'
-                elif status == 'inactive':
-                    trader_details[symbol.upper()] = 'Stopped'
-                else:
-                    trader_details[symbol.upper()] = f'Unknown ({status})'
+            # Discover all active trading services dynamically
+            trader_details = self.discover_active_scalper_services()
+            active_traders = [symbol for symbol, status in trader_details.items() if status == 'Running']
             
             # Get additional info
             last_analysis = self._get_last_analysis_time()
@@ -132,7 +178,8 @@ class DashboardData:
                 'trader_details': trader_details,
                 'trade_counts': trade_counts,
                 'dashboard_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'systemctl_path': self.systemctl_path
+                'systemctl_path': self.systemctl_path,
+                'total_services': len(trader_details)
             }
             
         except Exception as e:
@@ -144,7 +191,8 @@ class DashboardData:
                 'trader_details': {},
                 'trade_counts': {},
                 'dashboard_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'systemctl_path': self.systemctl_path
+                'systemctl_path': self.systemctl_path,
+                'total_services': 0
             }
     
     def _check_service_status(self, service_name):
@@ -165,9 +213,9 @@ class DashboardData:
                     return status
                     
         except Exception as e:
-            logger.error(f"Method 1 failed for {service_name}: {e}")
+            logger.debug(f"Method 1 failed for {service_name}: {e}")
         
-        # Method 2: Try with different environment
+        # Method 2: Try with sudo
         try:
             result = subprocess.run(
                 ['sudo', '/usr/bin/systemctl', 'is-active', service_name],
@@ -181,7 +229,7 @@ class DashboardData:
                 return status
                 
         except Exception as e:
-            logger.error(f"Method 2 failed for {service_name}: {e}")
+            logger.debug(f"Method 2 failed for {service_name}: {e}")
         
         # Method 3: Check process directly
         try:
@@ -199,33 +247,10 @@ class DashboardData:
                     text=True,
                     timeout=3
                 )
-                return 'running' if result.returncode == 0 else 'stopped'
+                return 'active' if result.returncode == 0 else 'inactive'
             
         except Exception as e:
-            logger.error(f"Method 3 failed for {service_name}: {e}")
-        
-        # Method 4: Check if log files are being written
-        try:
-            import time
-            log_path = f"/var/log/syslog"
-            if os.path.exists(log_path):
-                # Check if service logged anything in last 5 minutes
-                five_min_ago = time.time() - 300
-                stat = os.stat(log_path)
-                if stat.st_mtime > five_min_ago:
-                    # Check if our service appears in recent logs
-                    with open(log_path, 'r') as f:
-                        # Read last 100 lines
-                        lines = f.readlines()[-100:]
-                        for line in lines:
-                            if service_name in line:
-                                if 'started' in line.lower() or 'running' in line.lower():
-                                    return 'likely_running'
-                                elif 'stopped' in line.lower() or 'failed' in line.lower():
-                                    return 'likely_stopped'
-            
-        except Exception as e:
-            logger.error(f"Method 4 failed for {service_name}: {e}")
+            logger.debug(f"Method 3 failed for {service_name}: {e}")
         
         return 'unknown'
     
@@ -295,12 +320,12 @@ dashboard_data = DashboardData()
 
 @app.route('/')
 def dashboard():
-    """Trading dashboard"""
+    """Trading dashboard with dynamic service discovery"""
     return '''
     <!DOCTYPE html>
     <html>
     <head>
-        <title>AI Trading Dashboard</title>
+        <title>AI Trading Dashboard - Enhanced</title>
         <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
         <style>
             body { 
@@ -310,7 +335,7 @@ def dashboard():
                 min-height: 100vh;
                 padding: 20px;
             }
-            .container { max-width: 1200px; margin: 0 auto; }
+            .container { max-width: 1400px; margin: 0 auto; }
             .header { 
                 background: rgba(255,255,255,0.95); 
                 color: #2c3e50; 
@@ -319,18 +344,21 @@ def dashboard():
                 margin-bottom: 20px;
                 box-shadow: 0 4px 6px rgba(0,0,0,0.1);
             }
-            .symbol-tabs { margin: 20px 0; }
+            .symbol-tabs { margin: 20px 0; display: flex; flex-wrap: wrap; gap: 8px; }
             .tab { 
                 display: inline-block; 
-                padding: 12px 24px; 
+                padding: 8px 16px; 
                 background: rgba(255,255,255,0.9); 
                 color: #2c3e50; 
-                margin-right: 8px; 
                 cursor: pointer; 
-                border-radius: 25px;
+                border-radius: 20px;
                 transition: all 0.3s ease;
+                font-size: 12px;
+                min-width: 80px;
+                text-align: center;
             }
             .tab.active { background: #3498db; color: white; }
+            .tab:hover { background: #2980b9; color: white; }
             .metrics { 
                 display: grid; 
                 grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
@@ -363,27 +391,50 @@ def dashboard():
             }
             .status-running { color: #27ae60; font-weight: bold; }
             .status-stopped { color: #e74c3c; font-weight: bold; }
-            .status-unknown { color: #f39c12; font-weight: bold; }
+            .status-failed { color: #e74c3c; font-weight: bold; }
+            .status-inactive { color: #f39c12; font-weight: bold; }
+            .status-unknown { color: #95a5a6; font-weight: bold; }
+            .service-grid { 
+                display: grid; 
+                grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); 
+                gap: 8px; 
+                margin: 10px 0; 
+            }
+            .service-card { 
+                background: #f8f9fa; 
+                padding: 8px; 
+                border-radius: 8px; 
+                text-align: center; 
+                border-left: 4px solid #ddd;
+                cursor: pointer;
+                transition: all 0.3s ease;
+            }
+            .service-card:hover { background: #e9ecef; }
+            .service-card.running { border-left-color: #27ae60; }
+            .service-card.failed { border-left-color: #e74c3c; }
+            .service-card.inactive { border-left-color: #f39c12; }
+            .service-summary {
+                background: #e8f4fd;
+                padding: 10px;
+                border-radius: 5px;
+                margin-top: 10px;
+                border-left: 4px solid #3498db;
+            }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
-                <h1>🤖 AI Trading Dashboard</h1>
-                <p>Real-time cryptocurrency scalping performance</p>
+                <h1>🤖 AI Trading Dashboard - Enhanced</h1>
+                <p>Real-time cryptocurrency scalping performance with dynamic service discovery</p>
+                <div id="service-summary" class="service-summary"></div>
             </div>
             
-            <div class="symbol-tabs">
-                <div class="tab active" onclick="loadSymbol('BTCUSDT')">BTC/USDT</div>
-                <div class="tab" onclick="loadSymbol('ETHUSDT')">ETH/USDT</div>
-                <div class="tab" onclick="loadSymbol('ARBUSDT')">ARB/USDT</div>
-                <div class="tab" onclick="loadSymbol('SHIBUSDT')">SHIB/USDT</div>
-                <div class="tab" onclick="loadSymbol('ADAUSDT')">ADA/USDT</div>
-                <div class="tab" onclick="loadSymbol('DOGEUSDT')">DOGE/USDT</div>
-                <div class="tab" onclick="loadSymbol('XRPUSDT')">XRP/USDT</div>
-                <div class="tab" onclick="loadSymbol('BNBUSDT')">BNB/USDT</div>
-                <div class="tab" onclick="loadSymbol('PEPEUSDT')">PEPE/USDT</div>
-                <div class="tab" onclick="loadSymbol('TRONUSDT')">TRON/USDT</div>
+            <div class="symbol-tabs" id="symbol-tabs">
+                <!-- Tabs will be populated dynamically -->
+                <div class="tab active" onclick="loadSymbol('BTCUSDT')">BTC</div>
+                <div class="tab" onclick="loadSymbol('ETHUSDT')">ETH</div>
+                <div class="tab" onclick="loadSymbol('BNBUSDT')">BNB</div>
             </div>
             
             <div class="metrics">
@@ -421,6 +472,24 @@ def dashboard():
 
         <script>
             let currentSymbol = 'BTCUSDT';
+            let availableSymbols = [];
+            
+            function createSymbolTabs(symbols) {
+                const tabsContainer = document.getElementById('symbol-tabs');
+                tabsContainer.innerHTML = '';
+                
+                symbols.forEach((symbol, index) => {
+                    const tab = document.createElement('div');
+                    tab.className = `tab ${index === 0 ? 'active' : ''}`;
+                    tab.textContent = symbol.replace('USDT', '');
+                    tab.onclick = () => loadSymbol(symbol);
+                    tabsContainer.appendChild(tab);
+                });
+                
+                if (symbols.length > 0) {
+                    currentSymbol = symbols[0];
+                }
+            }
             
             function loadSymbol(symbol) {
                 currentSymbol = symbol;
@@ -429,7 +498,9 @@ def dashboard():
                 loadData(symbol);
             }
             
-            function loadData(symbol = 'BTCUSDT') {
+            function loadData(symbol) {
+                if (!symbol) return;
+                
                 fetch(`/api/performance/${symbol}`)
                     .then(response => response.json())
                     .then(data => {
@@ -457,72 +528,92 @@ def dashboard():
                             Plotly.newPlot('chart', JSON.parse(data.chart).data, JSON.parse(data.chart).layout);
                         }
                     })
-                    .catch(error => console.error('Error:', error));
+                    .catch(error => {
+                        console.error('Error loading data:', error);
+                        document.getElementById('chart').innerHTML = '<p style="text-align: center; color: #e74c3c;">Error loading chart data</p>';
+                    });
             }
             
             function loadStatus() {
                 fetch('/api/status')
                     .then(response => response.json())
                     .then(data => {
+                        // Update service summary
+                        const summaryElement = document.getElementById('service-summary');
+                        const runningCount = data.active_traders ? data.active_traders.length : 0;
+                        const totalCount = data.total_services || 0;
+                        summaryElement.innerHTML = `
+                            <strong>📊 Services:</strong> ${runningCount}/${totalCount} running | 
+                            <strong>🤖 AI Agent:</strong> ${data.ai_agent_status} | 
+                            <strong>🕒 Last Analysis:</strong> ${data.last_analysis}
+                        `;
+                        
+                        // Update symbol tabs based on discovered services
+                        const allSymbols = Object.keys(data.trader_details || {});
+                        if (allSymbols.length > 0 && JSON.stringify(allSymbols.sort()) !== JSON.stringify(availableSymbols)) {
+                            availableSymbols = allSymbols.sort();
+                            createSymbolTabs(availableSymbols);
+                            if (availableSymbols.includes(currentSymbol)) {
+                                loadData(currentSymbol);
+                            } else if (availableSymbols.length > 0) {
+                                currentSymbol = availableSymbols[0];
+                                loadData(currentSymbol);
+                            }
+                        }
+                        
                         let html = '';
                         
-                        // AI Agent
+                        // AI Agent status
                         const aiClass = data.ai_agent_status === 'active' ? 'status-running' : 
-                                       data.ai_agent_status.includes('Error') ? 'status-unknown' : 'status-stopped';
+                                       data.ai_agent_status && data.ai_agent_status.includes('Error') ? 'status-unknown' : 'status-stopped';
                         html += `<div class="status-item">
-                            <span><strong>AI Agent:</strong></span>
-                            <span class="${aiClass}">${data.ai_agent_status}</span>
+                            <span><strong>🤖 AI Agent:</strong></span>
+                            <span class="${aiClass}">${data.ai_agent_status || 'Unknown'}</span>
                         </div>`;
                         
-                        // Last Analysis
-                        html += `<div class="status-item">
-                            <span><strong>Last Analysis:</strong></span>
-                            <span>${data.last_analysis}</span>
-                        </div>`;
-                        
-                        // Traders
-                        if (data.trader_details) {
+                        // Service grid
+                        if (data.trader_details && Object.keys(data.trader_details).length > 0) {
+                            html += '<div style="margin-top: 15px;"><strong>📈 Trading Services:</strong></div>';
+                            html += '<div class="service-grid">';
+                            
                             Object.entries(data.trader_details).forEach(([symbol, status]) => {
-                                const statusClass = status === 'Running' ? 'status-running' : 
-                                                   status.includes('Unknown') ? 'status-unknown' : 'status-stopped';
-                                html += `<div class="status-item">
-                                    <span><strong>${symbol}:</strong></span>
-                                    <span class="${statusClass}">${status}</span>
+                                const statusClass = status === 'Running' ? 'running' : 
+                                                   status === 'Failed' ? 'failed' : 'inactive';
+                                const tradeCount = data.trade_counts ? (data.trade_counts[symbol] || 0) : 0;
+                                html += `<div class="service-card ${statusClass}" onclick="loadSymbol('${symbol}')">
+                                    <div style="font-weight: bold; font-size: 12px;">${symbol}</div>
+                                    <div style="font-size: 10px; color: #666;">${status}</div>
+                                    <div style="font-size: 10px; color: #666;">${tradeCount} trades/24h</div>
                                 </div>`;
                             });
+                            
+                            html += '</div>';
+                        } else {
+                            html += '<div style="margin-top: 15px; color: #666; text-align: center;">No trading services discovered</div>';
                         }
                         
-                        // Trade counts
-                        if (data.trade_counts && Object.keys(data.trade_counts).length > 0) {
-                            html += '<div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ecf0f1;"><strong>24h Trades:</strong></div>';
-                            Object.entries(data.trade_counts).forEach(([symbol, count]) => {
-                                html += `<div class="status-item">
-                                    <span>${symbol}:</span>
-                                    <span>${count}</span>
-                                </div>`;
-                            });
-                        }
-                        
-                        html += `<div class="status-item">
-                            <span><strong>Updated:</strong></span>
-                            <span>${data.dashboard_time}</span>
+                        html += `<div class="status-item" style="border-bottom: none; margin-top: 15px;">
+                            <span><strong>🕒 Updated:</strong></span>
+                            <span>${data.dashboard_time || 'Unknown'}</span>
                         </div>`;
                         
                         document.getElementById('status-info').innerHTML = html;
                     })
                     .catch(error => {
-                        document.getElementById('status-info').innerHTML = '<span style="color: #e74c3c;">Status check failed</span>';
+                        console.error('Error loading status:', error);
+                        document.getElementById('status-info').innerHTML = '<span style="color: #e74c3c;">❌ Status check failed</span>';
                     });
             }
             
             // Initial load
-            loadData();
             loadStatus();
             
-            // Auto refresh
+            // Auto refresh every 30 seconds
             setInterval(() => {
-                loadData(currentSymbol);
                 loadStatus();
+                if (currentSymbol) {
+                    loadData(currentSymbol);
+                }
             }, 30000);
         </script>
     </body>
@@ -538,5 +629,5 @@ def get_status():
     return jsonify(dashboard_data.get_system_status())
 
 if __name__ == '__main__':
-    logger.info("Starting dashboard on port 8080...")
+    logger.info("Starting enhanced dashboard on port 8080...")
     app.run(host='0.0.0.0', port=8080, debug=False)
